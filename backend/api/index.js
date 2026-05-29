@@ -2,9 +2,114 @@ const express = require('express');
 const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
+const { z } = require('zod'); // Step 1: Import Zod for future validations
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+
+// ==================== STEP 2: REUSABLE RESPONSE HELPERS ====================
+// Reusable helper function to send standardized success responses.
+// Why it matters in production: Reduces boilerplate, keeps code DRY, and guarantees that 
+// every successful API response has the exact same foundation (success: true).
+const sendSuccess = (res, statusCode, data = null, extra = {}) => {
+  return res.status(statusCode).json({
+    success: true,
+    ...extra,
+    ...(data !== null && { data })
+  });
+};
+
+// Reusable helper function to send standardized error responses.
+// Why it matters in production: Enforces consistent error format across the application. 
+// Standardized keys (success: false, error, message) make it easier for clients to display 
+// structured error dialogs/validations.
+const sendError = (res, statusCode, error, message, extra = {}) => {
+  return res.status(statusCode).json({
+    success: false,
+    error,
+    message,
+    ...extra
+  });
+};
+
+// ==================== STEP 3: ZOD SCHEMAS & VALIDATION MIDDLEWARE ====================
+
+// A. Zod Schemas with Custom Error Messages
+// Why custom error messages matter: Provides clear, user-friendly instructions to frontend/clients.
+const createUserSchema = z.object({
+  name: z
+    .string({ required_error: 'Name is required' })
+    .trim()
+    .min(2, 'Name must be at least 2 characters long')
+    .max(50, 'Name must be under 50 characters'),
+  email: z
+    .string({ required_error: 'Email is required' })
+    .trim()
+    .email('Invalid email format'),
+  age: z
+    .number()
+    .int('Age must be an integer')
+    .min(0, 'Age must be a positive number')
+    .max(150, 'Age cannot exceed 150')
+    .optional()
+});
+
+// For PUT (Full Update) - Same fields are required as Creation
+const updateUserSchema = createUserSchema;
+
+// For PATCH (Partial Update) - All fields optional, but body cannot be empty
+const patchUserSchema = z.object({
+  name: z
+    .string()
+    .trim()
+    .min(2, 'Name must be at least 2 characters long')
+    .max(50, 'Name must be under 50 characters')
+    .optional(),
+  email: z
+    .string()
+    .trim()
+    .email('Invalid email format')
+    .optional(),
+  age: z
+    .number()
+    .int('Age must be an integer')
+    .min(0, 'Age must be a positive number')
+    .max(150, 'Age cannot exceed 150')
+    .optional()
+}).refine((data) => {
+  // Ensure that at least one of the fields is provided
+  return data.name !== undefined || data.email !== undefined || data.age !== undefined;
+}, {
+  message: 'At least one field (name, email, or age) must be provided for update',
+  path: [] // Top-level object error
+});
+
+// B. Reusable Validation Middleware
+// Why middleware architecture is scalable: It allows us to intercept the request body, 
+// validate it automatically, and return validation errors before they ever hit our route controllers.
+// This keeps route code completely free of validation checks.
+const validateRequest = (schema) => {
+  return (req, res, next) => {
+    const result = schema.safeParse(req.body);
+    
+    if (!result.success) {
+      // Format Zod errors to be extremely readable
+      const errorDetails = result.error.errors.map((err) => ({
+        field: err.path.join('.') || 'body',
+        message: err.message
+      }));
+      
+      // Use our sendError helper to send standard 422 Validation Error responses
+      return sendError(res, 422, 'Validation Error', 'Input validation failed', {
+        details: errorDetails
+      });
+    }
+    
+    // Replace req.body with the parsed/cleaned data (Zod trims strings automatically)
+    req.body = result.data;
+    next();
+  };
+};
 
 // Middleware
 app.use(cors());
@@ -71,6 +176,7 @@ app.get('/', (req, res) => {
         'GET /api/users/:id': 'Get user by ID',
         'POST /api/users': 'Create new user',
         'PUT /api/users/:id': 'Update user (full)',
+        'PATCH /api/users/:id': 'Update user (partial)',
         'DELETE /api/users/:id': 'Delete user',
         'GET /api/reset': 'Reset data to initial state'
       }
@@ -84,180 +190,88 @@ app.get('/', (req, res) => {
 app.get('/api/users', (req, res) => {
   try {
     const users = readUsers();
-    
-    res.status(200).json({
-      success: true,
-      count: users.length,
-      data: users
-    });
+    return sendSuccess(res, 200, users, { count: users.length });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      error: 'Internal Server Error',
-      message: 'Failed to retrieve users'
-    });
+    console.error('Error retrieving users:', error);
+    return sendError(res, 500, 'Internal Server Error', 'Failed to retrieve users');
   }
 });
 
 // GET /api/users/:id - Get user by ID
 app.get('/api/users/:id', (req, res) => {
   try {
-    const users = readUsers();
     const userId = parseInt(req.params.id);
     
+    // Safely check if parameter is not a valid number
+    if (isNaN(userId)) {
+      return sendError(res, 400, 'Bad Request', 'User ID must be a valid number');
+    }
+    
+    const users = readUsers();
     const user = users.find(u => u.id === userId);
     
     if (!user) {
-      return res.status(404).json({
-        success: false,
-        error: 'Not Found',
-        message: `User with ID ${userId} not found`
-      });
+      return sendError(res, 404, 'Not Found', `User with ID ${userId} not found`);
     }
     
-    res.status(200).json({
-      success: true,
-      data: user
-    });
+    return sendSuccess(res, 200, user);
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      error: 'Internal Server Error',
-      message: 'Failed to retrieve user'
-    });
+    console.error('Error retrieving user:', error);
+    return sendError(res, 500, 'Internal Server Error', 'Failed to retrieve user');
   }
 });
 
-// POST /api/users - Create new user
-app.post('/api/users', (req, res) => {
+// POST /api/users - Create new user with schema validation middleware
+app.post('/api/users', validateRequest(createUserSchema), (req, res) => {
   try {
     const { name, email, age } = req.body;
-    
-    // Validation
-    if (!name || !email) {
-      return res.status(400).json({
-        success: false,
-        error: 'Bad Request',
-        message: 'Name and email are required fields',
-        requiredFields: ['name', 'email']
-      });
-    }
-    
-    // Email validation
-    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-    if (!emailRegex.test(email)) {
-      return res.status(422).json({
-        success: false,
-        error: 'Validation Error',
-        message: 'Invalid email format',
-        field: 'email'
-      });
-    }
-    
-    // Age validation (if provided)
-    if (age !== undefined && (typeof age !== 'number' || age < 0 || age > 150)) {
-      return res.status(422).json({
-        success: false,
-        error: 'Validation Error',
-        message: 'Age must be a number between 0 and 150',
-        field: 'age'
-      });
-    }
-    
     const users = readUsers();
     
-    // Check for duplicate email
+    // Check for duplicate email (normalize check case-insensitively)
     const existingUser = users.find(u => u.email.toLowerCase() === email.toLowerCase());
     if (existingUser) {
-      return res.status(409).json({
-        success: false,
-        error: 'Conflict',
-        message: 'User with this email already exists',
-        field: 'email'
-      });
+      return sendError(res, 409, 'Conflict', 'User with this email already exists', { field: 'email' });
     }
     
-    // Create new user
+    // Create new user (inputs are already trimmed by Zod schema)
     const newUser = {
       id: getNextId(users),
-      name: name.trim(),
-      email: email.trim().toLowerCase(),
+      name,
+      email,
       ...(age !== undefined && { age }),
       createdAt: new Date().toISOString()
     };
     
     users.push(newUser);
     
-    // Write to file
+    // Write changes in memory cache
     if (!writeUsers(users)) {
-      return res.status(500).json({
-        success: false,
-        error: 'Internal Server Error',
-        message: 'Failed to save user'
-      });
+      return sendError(res, 500, 'Internal Server Error', 'Failed to save user');
     }
     
-    res.status(201).json({
-      success: true,
-      message: 'User created successfully',
-      data: newUser
-    });
+    return sendSuccess(res, 201, newUser, { message: 'User created successfully' });
   } catch (error) {
     console.error('Error creating user:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Internal Server Error',
-      message: 'Failed to create user'
-    });
+    return sendError(res, 500, 'Internal Server Error', 'Failed to create user');
   }
 });
 
-// PUT /api/users/:id - Update user (full update)
-app.put('/api/users/:id', (req, res) => {
+// PUT /api/users/:id - Update user (full update) with schema validation middleware
+app.put('/api/users/:id', validateRequest(updateUserSchema), (req, res) => {
   try {
     const userId = parseInt(req.params.id);
+    
+    // Safely check if parameter is not a valid number
+    if (isNaN(userId)) {
+      return sendError(res, 400, 'Bad Request', 'User ID must be a valid number');
+    }
+    
     const { name, email, age } = req.body;
-    
-    // Validation
-    if (!name || !email) {
-      return res.status(400).json({
-        success: false,
-        error: 'Bad Request',
-        message: 'Name and email are required fields',
-        requiredFields: ['name', 'email']
-      });
-    }
-    
-    // Email validation
-    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-    if (!emailRegex.test(email)) {
-      return res.status(422).json({
-        success: false,
-        error: 'Validation Error',
-        message: 'Invalid email format',
-        field: 'email'
-      });
-    }
-    
-    // Age validation (if provided)
-    if (age !== undefined && (typeof age !== 'number' || age < 0 || age > 150)) {
-      return res.status(422).json({
-        success: false,
-        error: 'Validation Error',
-        message: 'Age must be a number between 0 and 150',
-        field: 'age'
-      });
-    }
-    
     const users = readUsers();
     const userIndex = users.findIndex(u => u.id === userId);
     
     if (userIndex === -1) {
-      return res.status(404).json({
-        success: false,
-        error: 'Not Found',
-        message: `User with ID ${userId} not found`
-      });
+      return sendError(res, 404, 'Not Found', `User with ID ${userId} not found`);
     }
     
     // Check for duplicate email (excluding current user)
@@ -265,19 +279,14 @@ app.put('/api/users/:id', (req, res) => {
       u.email.toLowerCase() === email.toLowerCase() && u.id !== userId
     );
     if (existingUser) {
-      return res.status(409).json({
-        success: false,
-        error: 'Conflict',
-        message: 'Another user with this email already exists',
-        field: 'email'
-      });
+      return sendError(res, 409, 'Conflict', 'Another user with this email already exists', { field: 'email' });
     }
     
-    // Update user (keep original createdAt)
+    // Update user (keep original createdAt, inputs already sanitized by Zod)
     const updatedUser = {
       id: userId,
-      name: name.trim(),
-      email: email.trim().toLowerCase(),
+      name,
+      email,
       ...(age !== undefined && { age }),
       createdAt: users[userIndex].createdAt,
       updatedAt: new Date().toISOString()
@@ -285,27 +294,67 @@ app.put('/api/users/:id', (req, res) => {
     
     users[userIndex] = updatedUser;
     
-    // Write to file
+    // Write changes in memory cache
     if (!writeUsers(users)) {
-      return res.status(500).json({
-        success: false,
-        error: 'Internal Server Error',
-        message: 'Failed to update user'
-      });
+      return sendError(res, 500, 'Internal Server Error', 'Failed to update user');
     }
     
-    res.status(200).json({
-      success: true,
-      message: 'User updated successfully',
-      data: updatedUser
-    });
+    return sendSuccess(res, 200, updatedUser, { message: 'User updated successfully' });
   } catch (error) {
     console.error('Error updating user:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Internal Server Error',
-      message: 'Failed to update user'
-    });
+    return sendError(res, 500, 'Internal Server Error', 'Failed to update user');
+  }
+});
+
+// PATCH /api/users/:id - Partial update user with schema validation middleware
+app.patch('/api/users/:id', validateRequest(patchUserSchema), (req, res) => {
+  try {
+    const userId = parseInt(req.params.id);
+    
+    // Safely check if parameter is not a valid number
+    if (isNaN(userId)) {
+      return sendError(res, 400, 'Bad Request', 'User ID must be a valid number');
+    }
+    
+    const users = readUsers();
+    const userIndex = users.findIndex(u => u.id === userId);
+    
+    if (userIndex === -1) {
+      return sendError(res, 404, 'Not Found', `User with ID ${userId} not found`);
+    }
+    
+    // If email is being updated, check for duplicates (excluding current user)
+    if (req.body.email) {
+      const emailToCheck = req.body.email.toLowerCase();
+      const duplicateUser = users.find(u => 
+        u.email.toLowerCase() === emailToCheck && u.id !== userId
+      );
+      if (duplicateUser) {
+        return sendError(res, 409, 'Conflict', 'Another user with this email already exists', { field: 'email' });
+      }
+    }
+    
+    // Merge updates safely
+    const originalUser = users[userIndex];
+    const updatedUser = {
+      ...originalUser,
+      ...req.body,
+      id: userId, // Lock ID integrity
+      createdAt: originalUser.createdAt, // Lock original timestamp
+      updatedAt: new Date().toISOString()
+    };
+    
+    users[userIndex] = updatedUser;
+    
+    // Save updated users back to memory cache
+    if (!writeUsers(users)) {
+      return sendError(res, 500, 'Internal Server Error', 'Failed to update user');
+    }
+    
+    return sendSuccess(res, 200, updatedUser, { message: 'User partially updated successfully' });
+  } catch (error) {
+    console.error('Error partially updating user:', error);
+    return sendError(res, 500, 'Internal Server Error', 'Failed to update user');
   }
 });
 
@@ -313,46 +362,35 @@ app.put('/api/users/:id', (req, res) => {
 app.delete('/api/users/:id', (req, res) => {
   try {
     const userId = parseInt(req.params.id);
-    const users = readUsers();
     
+    // Safely check if parameter is not a valid number
+    if (isNaN(userId)) {
+      return sendError(res, 400, 'Bad Request', 'User ID must be a valid number');
+    }
+    
+    const users = readUsers();
     const userIndex = users.findIndex(u => u.id === userId);
     
     if (userIndex === -1) {
-      return res.status(404).json({
-        success: false,
-        error: 'Not Found',
-        message: `User with ID ${userId} not found`
-      });
+      return sendError(res, 404, 'Not Found', `User with ID ${userId} not found`);
     }
     
     const deletedUser = users[userIndex];
     users.splice(userIndex, 1);
     
-    // Write to file
+    // Write changes in memory cache
     if (!writeUsers(users)) {
-      return res.status(500).json({
-        success: false,
-        error: 'Internal Server Error',
-        message: 'Failed to delete user'
-      });
+      return sendError(res, 500, 'Internal Server Error', 'Failed to delete user');
     }
     
-    res.status(200).json({
-      success: true,
-      message: 'User deleted successfully',
-      data: {
-        id: userId,
-        name: deletedUser.name,
-        email: deletedUser.email
-      }
-    });
+    return sendSuccess(res, 200, {
+      id: userId,
+      name: deletedUser.name,
+      email: deletedUser.email
+    }, { message: 'User deleted successfully' });
   } catch (error) {
     console.error('Error deleting user:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Internal Server Error',
-      message: 'Failed to delete user'
-    });
+    return sendError(res, 500, 'Internal Server Error', 'Failed to delete user');
   }
 });
 
@@ -363,33 +401,26 @@ app.get('/api/reset', (req, res) => {
     usersCache = null;
     const users = readUsers();
     
-    res.status(200).json({
-      success: true,
+    return sendSuccess(res, 200, users, { 
       message: 'Data reset to initial state',
-      count: users.length,
-      data: users
+      count: users.length
     });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      error: 'Internal Server Error',
-      message: 'Failed to reset data'
-    });
+    console.error('Error resetting data:', error);
+    return sendError(res, 500, 'Internal Server Error', 'Failed to reset data');
   }
 });
 
 // 404 handler for undefined routes
 app.use((req, res) => {
-  res.status(404).json({
-    success: false,
-    error: 'Not Found',
-    message: `Route ${req.method} ${req.url} not found`,
+  return sendError(res, 404, 'Not Found', `Route ${req.method} ${req.url} not found`, {
     availableEndpoints: [
       'GET /',
       'GET /api/users',
       'GET /api/users/:id',
       'POST /api/users',
       'PUT /api/users/:id',
+      'PATCH /api/users/:id',
       'DELETE /api/users/:id',
       'GET /api/reset'
     ]
@@ -399,11 +430,7 @@ app.use((req, res) => {
 // Error handling middleware
 app.use((err, req, res, next) => {
   console.error('Unhandled error:', err);
-  res.status(500).json({
-    success: false,
-    error: 'Internal Server Error',
-    message: 'An unexpected error occurred'
-  });
+  return sendError(res, 500, 'Internal Server Error', 'An unexpected error occurred');
 });
 
 // Start server

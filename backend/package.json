@@ -18,8 +18,9 @@
   "author": "Nisal Gunawardhana",
   "license": "MIT",
   "dependencies": {
+    "cors": "^2.8.5",
     "express": "^4.18.2",
-    "cors": "^2.8.5"
+    "zod": "^4.4.3"
   },
   "devDependencies": {
     "nodemon": "^3.0.2"
